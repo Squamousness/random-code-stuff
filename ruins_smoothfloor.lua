@@ -23,7 +23,7 @@ local SMOOTH_CLASSES = {
 local STONE_MAT        = df.tiletype_material.STONE
 local LAVA_STONE_MAT   = df.tiletype_material.LAVA_STONE
 local SHAPE_WALL       = df.tiletype_shape.WALL
-local SHAPE_OPEN_SPACE = df.tiletype_shape.OPEN_SPACE or -1
+local SHAPE_OPEN_SPACE = df.tiletype_shape.EMPTY or -1
 local SPECIAL_SMOOTH   = df.tiletype_special.SMOOTH
 local BASIC_FLOOR      = df.tiletype_shape_basic.Floor
 local BASIC_PEBBLE     = df.tiletype_shape_basic.Pebble
@@ -41,11 +41,11 @@ local smooth_lava_wall_tt_set     = {}
 
 for _, pair in ipairs{ {"Stone", smooth_stone_wall_by_suffix}, {"Lava", smooth_lava_wall_by_suffix} } do
     local prefix, tbl = pair[1], pair[2]
-    for _, L in ipairs{"", "L"} do for _, R in ipairs{"", "R"} do
-    for _, U in ipairs{"", "U"} do for _, D in ipairs{"", "D"} do
-        local suffix = L..R..U..D
+    for li = 0, 1 do for ri = 0, 1 do
+    for ui = 0, 1 do for di = 0, 1 do
+        local suffix = (li==1 and "L" or "")..(ri==1 and "R" or "")..(ui==1 and "U" or "")..(di==1 and "D" or "")
         local num = df.tiletype[prefix.."WallSmooth"..suffix]
-        if num then tbl[suffix] = num end
+        if num then tbl[li + ri*2 + ui*4 + di*8] = num end
     end end end end
 end
 
@@ -144,18 +144,6 @@ local function build_inorganic_cache()
 end
 
 -- ============================================================================
--- BIOME LOOKUP
--- ============================================================================
-
-local function get_biome_for_tile(wx, wy, wz)
-    local rx, ry = dfhack.maps.getTileBiomeRgn(wx, wy, wz)
-    if not rx then return nil end
-    local ri = dfhack.maps.getRegionBiome(rx, ry)
-    if not ri then return nil end
-    return df.world_geo_biome.get_vector()[ri.geo_index]
-end
-
--- ============================================================================
 -- WALL SUFFIX HELPERS
 -- ============================================================================
 
@@ -165,15 +153,15 @@ local function wall_at(nx, ny, nz)
     return a ~= nil and a.shape == SHAPE_WALL
 end
 
-local function get_wall_suffix(wx, wy, wz)
-    return (wall_at(wx-1, wy,   wz) and "L" or "")
-        .. (wall_at(wx+1, wy,   wz) and "R" or "")
-        .. (wall_at(wx,   wy-1, wz) and "U" or "")
-        .. (wall_at(wx,   wy+1, wz) and "D" or "")
+local function get_wall_idx(wx, wy, wz)
+    return (wall_at(wx-1, wy,   wz) and 1 or 0)
+         + (wall_at(wx+1, wy,   wz) and 2 or 0)
+         + (wall_at(wx,   wy-1, wz) and 4 or 0)
+         + (wall_at(wx,   wy+1, wz) and 8 or 0)
 end
 
 local function pick_smooth_wall_tt(tbl, fallback, wx, wy, wz)
-    return tbl[get_wall_suffix(wx, wy, wz)] or fallback
+    return tbl[get_wall_idx(wx, wy, wz)] or fallback
 end
 
 -- ============================================================================
@@ -182,20 +170,44 @@ end
 
 -- include_hidden: when true, smooths hidden tiles too (used for LOS-boundary and BFS pre-smooth)
 local function scan_block(block, resuffix, include_hidden)
-    if not smooth_inorganic_cache then return 0, 0 end
+    if not smooth_inorganic_cache then return 0, 0, false, false end
     local floors, walls = 0, 0
     local bx = block.map_pos.x
     local by = block.map_pos.y
     local bz = block.map_pos.z
+    local biome_cache  = {}
+    local has_non_open = false
+    local has_non_wall = false
 
     for lx = 0, 15 do
         for ly = 0, 15 do
             local tt   = block.tiletype[lx][ly]
             local kind = tt_kind[tt]
+            if kind then
+                has_non_open = true
+                if kind == 'sf' or kind == 'lf' then has_non_wall = true end
+            else
+                local a = df.tiletype.attrs[tt]
+                if a then
+                    if a.shape ~= SHAPE_OPEN_SPACE then has_non_open = true end
+                    if a.shape ~= SHAPE_WALL        then has_non_wall = true end
+                end
+            end
             if kind == 'sf' or kind == 'sw' or kind == 'lf' or kind == 'lw' then
                 if include_hidden or not block.designation[lx][ly].hidden then
                     local floor_ok, wall_ok
-                    local b = get_biome_for_tile(bx+lx, by+ly, bz)
+                    local rx, ry = dfhack.maps.getTileBiomeRgn(bx+lx, by+ly, bz)
+                    local b
+                    if rx then
+                        local ck = rx * 100000 + ry
+                        b = biome_cache[ck]
+                        if b == nil then
+                            local ri = dfhack.maps.getRegionBiome(rx, ry)
+                            b = ri and df.world_geo_biome.find(ri.geo_index) or false
+                            biome_cache[ck] = b
+                        end
+                        if b == false then b = nil end
+                    end
                     if b then
                         local layer = b.layers[block.designation[lx][ly].geolayer_index]
                         local cfg   = layer and smooth_inorganic_cache[layer.mat_index]
@@ -233,7 +245,7 @@ local function scan_block(block, resuffix, include_hidden)
         end
     end
 
-    return floors, walls
+    return floors, walls, has_non_open, has_non_wall
 end
 
 local function is_player_map()
@@ -329,9 +341,11 @@ end
 -- Processes up to BLOCKS_PER_TICK entries from the front of the BFS queue.
 local function bfs_step()
     if S.bfs_head > S.bfs_tail then return end
-    local map   = df.global.world.map
-    local limit = math.min(S.bfs_head + BLOCKS_PER_TICK - 1, S.bfs_tail)
-    local tf, tw = 0, 0
+    local map        = df.global.world.map
+    local limit      = math.min(S.bfs_head + BLOCKS_PER_TICK - 1, S.bfs_tail)
+    local tf, tw     = 0, 0
+    local pbx, pby, pbz = player_block_pos()
+    local in_dungeon = is_dungeon_view()
 
     for i = S.bfs_head, limit do
         local entry      = S.bfs_queue[i]
@@ -343,29 +357,31 @@ local function bfs_step()
         local block = dfhack.maps.getTileBlock(bx, by, bz)
         if block then
             S.bfs_done[k] = true
-            local pbx, pby, pbz = player_block_pos()
-            local in_view = is_dungeon_view() and pbx ~= nil
+            local in_view = in_dungeon and pbx ~= nil
                 and math.abs(bx - pbx) / 16 <= VISIBLE_BLOCK_RADIUS
                 and math.abs(by - pby) / 16 <= VISIBLE_BLOCK_RADIUS
                 and math.abs(bz - pbz) <= 1
+            local has_non_open, has_non_wall
             if not in_view then
-                local f, w = scan_block(block, false, true)
+                local f, w, nno, nnw = scan_block(block, false, true)
                 tf = tf + f; tw = tw + w
-            end
-
-            local has_non_open = false
-            local has_non_wall = false
-            for lx = 0, 15 do
-                for ly = 0, 15 do
-                    local a = df.tiletype.attrs[block.tiletype[lx][ly]]
-                    if a then
-                        if a.shape ~= SHAPE_OPEN_SPACE then has_non_open = true end
-                        if a.shape ~= SHAPE_WALL        then has_non_wall = true end
+                has_non_open = nno
+                has_non_wall = nnw
+            else
+                has_non_open = false
+                has_non_wall = false
+                for lx = 0, 15 do
+                    for ly = 0, 15 do
+                        local a = df.tiletype.attrs[block.tiletype[lx][ly]]
+                        if a then
+                            if a.shape ~= SHAPE_OPEN_SPACE then has_non_open = true end
+                            if a.shape ~= SHAPE_WALL        then has_non_wall = true end
+                        end
+                        if has_non_open and has_non_wall then goto bfs_analyze_done end
                     end
-                    if has_non_open and has_non_wall then goto bfs_analyze_done end
                 end
+                ::bfs_analyze_done::
             end
-            ::bfs_analyze_done::
 
             if bx >= 16              then bfs_enqueue(bx - 16, by,     bz) end
             if bx + 16 < map.x_count then bfs_enqueue(bx + 16, by,     bz) end
